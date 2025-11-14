@@ -1,120 +1,136 @@
 import cv2
 import numpy as np
 import os
-import random
+
+def resize_for_processing(frame, max_side=None):
+    """Resize keeping aspect ratio so the longest side is max_side."""
+    if max_side is None:
+        return frame
+    h, w = frame.shape[:2]
+    longest = max(h, w)
+    if longest <= max_side:
+        return frame
+    scale = max_side / float(longest)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    return cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 def is_sharp(image):
-    """Returns sharpness value of the image based on Laplacian variance."""
+    """Sharpness value of the image based on Laplacian variance."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-def estimate_threshold(video_path, sample_frames=200, quantile=0.3):
+def analyze_video_for_sharpness(video_path, resize_max_side=None, quantile=0.3):
     """
-    Estimate a blur threshold from a subset of frames.
-    quantile = 0.3 means we keep frames sharper than the 30 percent weakest.
+    First pass.
+    Compute sharpness for every frame, find threshold by quantile,
+    and count how many frames are above that threshold.
     """
     cap = cv2.VideoCapture(video_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if total_frames <= 0:
-        cap.release()
-        return 20.0  # fallback
-
-    indices = list(range(total_frames))
-    if len(indices) > sample_frames:
-        indices = random.sample(indices, sample_frames)
-
-    sharpness_values = []
-
-    for idx in sorted(indices):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            continue
-        sharpness_values.append(is_sharp(frame))
-
-    cap.release()
-
-    if not sharpness_values:
-        return 20.0
-
-    sharpness_values = np.array(sharpness_values, dtype=np.float64)
-    threshold = float(np.quantile(sharpness_values, quantile))
-    return threshold
-
-def extract_sharp_frames(
-    video_path,
-    output_folder,
-    threshold=None,
-    sharp_frame_interval=20,
-    flip_horizontal=False,
-    flip_vertical=False,
-    resize_short_side=None,
-):
-    cap = cv2.VideoCapture(video_path)
-    frame_count = 0
-    saved_count = 0
-    sharp_frame_count = 0
-
-    max_variance = 0.0
-    sharpest_frame = None
-
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
-    # Auto threshold if not provided
-    if threshold is None:
-        print("Estimating sharpness threshold...")
-        threshold = estimate_threshold(video_path)
-        print(f"Using automatic sharpness threshold: {threshold:.2f}")
-    else:
-        print(f"Using fixed sharpness threshold: {threshold:.2f}")
+    variances = []
+    total_frames = 0
 
     while True:
         ret, frame = cap.read()
         if not ret or frame is None:
             break
 
-        # Optional downscale to speed up processing
-        if resize_short_side is not None:
-            h, w = frame.shape[:2]
-            if h < w:
-                new_h = resize_short_side
-                new_w = int(w * (new_h / h))
-            else:
-                new_w = resize_short_side
-                new_h = int(h * (new_w / w))
-            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        frame_proc = resize_for_processing(frame, resize_max_side)
+        var = is_sharp(frame_proc)
+        variances.append(var)
+        total_frames += 1
 
-        variance = is_sharp(frame)
+    cap.release()
 
-        if variance > threshold:
-            sharp_frame_count += 1
+    if not variances:
+        return 20.0, 0, total_frames
 
-            if variance > max_variance:
-                max_variance = variance
-                sharpest_frame = frame.copy()
+    var_arr = np.array(variances, dtype=np.float64)
+    threshold = float(np.quantile(var_arr, quantile))
+    sharp_mask = var_arr > threshold
+    sharp_count = int(sharp_mask.sum())
 
-            if sharp_frame_count % sharp_frame_interval == 0 and sharpest_frame is not None:
-                out_frame = sharpest_frame
+    return threshold, sharp_count, total_frames
 
-                # Conditional flipping
+def extract_sharp_frames(
+    video_path,
+    output_folder,
+    threshold=None,
+    sharp_frame_interval=20,
+    target_saved_frames=None,
+    flip_horizontal=False,
+    flip_vertical=False,
+    resize_max_side=1080,
+    save_max_side=1080,
+    quantile=0.3,
+):
+    # First pass: threshold and sharp frame stats
+    print("Analyzing video for sharpness stats...")
+    if threshold is None:
+        threshold, sharp_count, total_frames = analyze_video_for_sharpness(
+            video_path,
+            resize_max_side=resize_max_side,
+            quantile=quantile,
+        )
+    else:
+        # If threshold is fixed, still need stats to choose interval if target_saved_frames used
+        threshold_tmp, sharp_count, total_frames = analyze_video_for_sharpness(
+            video_path,
+            resize_max_side=resize_max_side,
+            quantile=quantile,
+        )
+        total_frames = total_frames  # just to be explicit
+
+    # Decide interval
+    if target_saved_frames is not None and sharp_count > 0:
+        interval = max(1, sharp_count // target_saved_frames)
+    else:
+        interval = max(1, sharp_frame_interval)
+
+    print(f"Total video frames: {total_frames}")
+    print(f"Sharpness threshold: {threshold:.2f}")
+    print(f"Frames above threshold: {sharp_count}")
+    print(f"Using save interval: every {interval} sharp frames")
+
+    # Make output folder
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    # Second pass: actually save frames
+    cap = cv2.VideoCapture(video_path)
+    frame_index = 0
+    sharp_seen = 0
+    saved_count = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            break
+
+        frame_proc = resize_for_processing(frame, resize_max_side)
+        var = is_sharp(frame_proc)
+
+        if var > threshold:
+            sharp_seen += 1
+
+            if sharp_seen % interval == 0:
+                out_frame = frame_proc
+
                 if flip_horizontal:
                     out_frame = cv2.flip(out_frame, 1)
                 if flip_vertical:
                     out_frame = cv2.flip(out_frame, 0)
 
+                out_frame = resize_for_processing(out_frame, save_max_side)
+
                 save_path = os.path.join(output_folder, f"frame_{saved_count:06d}.jpg")
                 cv2.imwrite(save_path, out_frame)
                 saved_count += 1
 
-                max_variance = 0.0
-                sharpest_frame = None
-
-        frame_count += 1
+        frame_index += 1
 
     cap.release()
-    print(f"Total video frames: {frame_count}")
+
     print(f"Saved sharp frames: {saved_count}")
 
 if __name__ == "__main__":
@@ -124,9 +140,12 @@ if __name__ == "__main__":
     extract_sharp_frames(
         video_path=video_path,
         output_folder=output_folder,
-        threshold=None,               # None means automatic estimation
-        sharp_frame_interval=20,
-        flip_horizontal=False,        # I would keep both False for COLMAP
+        threshold=None,            # auto from quantile
+        sharp_frame_interval=20,   # fallback if target_saved_frames is None
+        target_saved_frames=800,   # what you asked for
+        flip_horizontal=False,
         flip_vertical=False,
-        resize_short_side=720,        # Downscale for faster sharpness checks
+        resize_max_side=1080,      # process around 1080p
+        save_max_side=1080,        # save around 1080p
+        quantile=0.3,              # drop the worst 30 percent blur
     )
